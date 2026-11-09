@@ -25,6 +25,13 @@ def github(tmp_path, monkeypatch):
                     "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
                         {"context": "required", "app": {"databaseId": 1}}]}}}}}}
             elif "/rules/branches/" in self.path:
+                if state.get("rules_error"):
+                    code, message = state["rules_error"]
+                    body = json.dumps({"message": message, "status": str(code)}).encode()
+                    self.send_response(code)
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 value = [[]]
             elif "/check-runs" in self.path:
                 run = {"id": 42, "name": "required", "head_sha": sha,
@@ -60,9 +67,16 @@ def github(tmp_path, monkeypatch):
     shim = tmp_path / "bin"
     shim.mkdir()
     gh = shim / "gh"
-    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request\n"
+    # Mirrors real gh on an HTTP error: JSON body on stdout, "gh: <message> (HTTP nnn)" on stderr, exit 1.
+    gh.write_text(f"#!{sys.executable}\nimport json,sys,urllib.error,urllib.request\n"
                   f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
-                  "print(urllib.request.urlopen(u).read().decode())\n")
+                  "try:\n"
+                  "    print(urllib.request.urlopen(u).read().decode())\n"
+                  "except urllib.error.HTTPError as e:\n"
+                  "    body = e.read().decode()\n"
+                  "    print(body)\n"
+                  "    sys.stderr.write('gh: %s (HTTP %d)\\n' % (json.loads(body)['message'], e.code))\n"
+                  "    sys.exit(1)\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -230,3 +244,73 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+# --- Private repos on a free plan: the rulesets REST API is plan-gated (403) ---
+
+_PLAN_403 = (403, "Upgrade to GitHub Pro or make this repository public to enable this feature.")
+
+
+@pytest.mark.platforms("posix")
+def test_plan_gated_rules_403_falls_back_to_branch_protection_checks(github):
+    """A free-plan private repo 403s on /rules/branches; GraphQL branch protection still
+    names the required checks, so the gate keeps going and records why rules are absent."""
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    github["rules_error"] = _PLAN_403
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["rules_api"] == "unavailable (403)"
+    assert receipt["required"] == [{"context": "required", "app_id": 1}]
+    assert receipt["classification"] == "success" and receipt["ok"] is True
+    assert receipt["checks"][0]["id"] == 42
+    # Still evidence-driven: a failing required check fails the gate.
+    github["conclusion"] = "failure"
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["rules_api"] == "unavailable (403)"
+    assert receipt["classification"] == "failure" and receipt["ok"] is False
+    # And the whole lifecycle completes a card on such a repo.
+    github["conclusion"] = "success"
+    with connect() as conn:
+        tid = kb.create_task(conn, title="free-plan", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done",
+                                metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        assert kb.get_task(conn, tid).status == "done"
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("error,classification", [
+    ((403, "Resource not accessible by personal access token"), "auth"),  # real refusal, not plan-gated
+    ((404, "Not Found"), "auth"),
+    ((500, "Server Error"), "infra"),
+])
+def test_other_rules_api_errors_still_fail_closed(github, error, classification):
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    github["rules_error"] = error
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False
+    assert receipt["classification"] == classification
+    assert "rules_api" not in receipt
+    assert not any("/check-runs" in p for p in github["requests"])  # stopped before reading checks
+
+
+@pytest.mark.platforms("posix")
+def test_plan_gated_rules_403_with_no_branch_protection_keeps_local_only_hint(github, monkeypatch):
+    """No rulesets API and no branch protection: nothing is required, so the gate keeps
+    its existing 'use local-only' answer instead of passing vacuously."""
+    import hermes_cli.kanban_pr_acceptance as acc
+
+    real = acc._api
+
+    def no_protection(endpoint, **kw):
+        value = real(endpoint, **kw)
+        if endpoint == "graphql":
+            value["data"]["repository"]["pullRequest"]["baseRef"] = {"branchProtectionRule": None}
+        return value
+
+    monkeypatch.setattr(acc, "_api", no_protection)
+    github["rules_error"] = _PLAN_403
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False and receipt["classification"] == "missing"
+    assert receipt["required"] == [] and "local-only" in receipt["detail"]
+    assert receipt["rules_api"] == "unavailable (403)"

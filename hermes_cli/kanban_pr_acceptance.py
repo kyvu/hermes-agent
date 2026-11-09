@@ -43,9 +43,12 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
         # 401/403/404 = the login cannot see this repository (wrong profile identity
         # or missing grant), not a transient API failure. Persist only the status
         # code + endpoint, never gh's stderr (credentials/host details).
-        denied = re.search(r"HTTP (40[134])", exc.stderr or "")
+        stderr = exc.stderr or ""
+        denied = re.search(r"HTTP (40[134])", stderr)
         if denied:
-            raise _GateAuthError(f"HTTP {denied[1]} on {endpoint.split('?')[0]}") from None
+            raise _GateAuthError(f"HTTP {denied[1]} on {endpoint.split('?')[0]}",
+                                 status=int(denied[1]),
+                                 plan_gated=denied[1] == "403" and bool(_PLAN_GATED.search(stderr))) from None
         if exc.returncode == 4:  # gh's authentication-required exit: this profile has no login
             raise _GateAuthError(f"gh has no login for {endpoint.split('?')[0]}") from None
         raise
@@ -59,6 +62,18 @@ class _GateAuthError(RuntimeError):
     """gh was refused at HTTP 401/403/404 (or GraphQL returned no repository):
     this profile's login cannot see the repo — an identity problem to fix, not
     an infrastructure blip to retry."""
+
+    def __init__(self, message: str, *, status: int | None = None, plan_gated: bool = False):
+        super().__init__(message)
+        self.status = status
+        # GitHub's "Upgrade to GitHub Pro or make this repository public" 403: the
+        # feature is not on this plan, the login itself can read the repo.
+        self.plan_gated = plan_gated
+
+
+# Message GitHub returns when a REST feature (e.g. branch rulesets on a private repo
+# of a free account) needs a paid plan. Matched only; never persisted.
+_PLAN_GATED = re.compile(r"Upgrade to GitHub (Pro|Team|Enterprise)|make this repository public", re.I)
 
 
 def _gh_env(profile_home: str | None) -> dict[str, str] | None:
@@ -133,8 +148,18 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
-                     paginate=True, profile_home=profile_home)
+        try:
+            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+                         paginate=True, profile_home=profile_home)
+        except _GateAuthError as exc:
+            # Private repos on a free plan have no rulesets API (plan-gated 403). The
+            # GraphQL read above already proved this login can see the repo, so carry
+            # on with the branch-protection required checks. Any other refusal or error
+            # still fails closed.
+            if not (exc.status == 403 and exc.plan_gated):
+                raise
+            receipt["rules_api"] = "unavailable (403)"
+            rules = []
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":
