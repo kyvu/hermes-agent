@@ -45,7 +45,8 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
         # code + endpoint, never gh's stderr (credentials/host details).
         denied = re.search(r"HTTP (40[134])", exc.stderr or "")
         if denied:
-            raise _GateAuthError(f"HTTP {denied[1]} on {endpoint.split('?')[0]}") from None
+            raise _GateAuthError(f"HTTP {denied[1]} on {endpoint.split('?')[0]}",
+                                 plan_gated=denied[1] == "403" and bool(_PLAN_GATED.search(exc.stderr or ""))) from None
         if exc.returncode == 4:  # gh's authentication-required exit: this profile has no login
             raise _GateAuthError(f"gh has no login for {endpoint.split('?')[0]}") from None
         raise
@@ -58,7 +59,19 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
 class _GateAuthError(RuntimeError):
     """gh was refused at HTTP 401/403/404 (or GraphQL returned no repository):
     this profile's login cannot see the repo — an identity problem to fix, not
-    an infrastructure blip to retry."""
+    an infrastructure blip to retry.
+
+    LOCAL PATCH (kyvu, 2026-11-21): ``plan_gated`` marks GitHub's "Upgrade to GitHub
+    Pro or make this repository public" 403. The login can read the repo; only the
+    feature (branch rulesets on a free-plan private repo) is unavailable."""
+
+    def __init__(self, message: str, *, plan_gated: bool = False):
+        super().__init__(message)
+        self.plan_gated = plan_gated
+
+
+# Matched only, never persisted.
+_PLAN_GATED = re.compile(r"Upgrade to GitHub (Pro|Team|Enterprise)|make this repository public", re.I)
 
 
 # Every key gh can read a login from, github.com and GitHub Enterprise alike. All of them are
@@ -164,8 +177,17 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
-                     paginate=True, profile_home=profile_home)
+        try:
+            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+                         paginate=True, profile_home=profile_home)
+        except _GateAuthError as exc:
+            # LOCAL PATCH (kyvu): free-plan private repos have no rulesets API (plan-gated
+            # 403). The GraphQL read above already proved this login sees the repo, so use
+            # the branch-protection required checks. Any other refusal still fails closed.
+            if not exc.plan_gated:
+                raise
+            receipt["rules_api"] = "unavailable (403)"
+            rules = []
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":

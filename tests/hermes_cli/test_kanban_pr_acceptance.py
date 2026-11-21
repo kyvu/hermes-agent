@@ -347,3 +347,38 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+# LOCAL PATCH (kyvu 2026-11-21): free-plan private repos 403 the rulesets API.
+@pytest.mark.parametrize("stderr, gated", [
+    ("gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)", True),
+    ("gh: Resource not accessible by integration (HTTP 403)", False),
+])
+def test_plan_gated_rules_403_falls_back_to_branch_protection(monkeypatch, stderr, gated):
+    import subprocess
+    from hermes_cli import kanban_pr_acceptance as acc
+    sha = "a" * 40
+
+    def fake_run(command, **kwargs):
+        endpoint = command[2]
+        if "/rules/branches/" in endpoint:
+            raise subprocess.CalledProcessError(1, command, "", stderr)
+        if endpoint == "graphql":
+            value = {"data": {"repository": {"pullRequest": {"headRefOid": sha, "baseRefName": "main",
+                     "state": "OPEN", "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
+                         {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+        elif "/check-runs" in endpoint:
+            value = [{"total_count": 1, "check_runs": [{"id": 42, "name": "required", "head_sha": sha,
+                      "app": {"id": 1}, "status": "completed", "conclusion": "success"}]}]
+        elif "/statuses" in endpoint:
+            value = [[]]
+        else:
+            value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
+        return subprocess.CompletedProcess(command, 0, json.dumps(value), "")
+
+    monkeypatch.setattr(acc.subprocess, "run", fake_run)
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    if gated:
+        assert receipt["ok"] and receipt["rules_api"] == "unavailable (403)"
+    else:
+        assert not receipt["ok"] and receipt["classification"] == "auth"
