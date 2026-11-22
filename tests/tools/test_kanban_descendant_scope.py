@@ -175,3 +175,37 @@ def test_child_shell_can_write_a_kanban_board_outside_its_lineage_root(tmp_path,
     scratch_conn = connect(scratch_home / "kanban.db")
     assert kb.get_task(scratch_conn, row["scratch"]).title == "scratch"
     scratch_conn.close()
+
+
+def test_fenced_descendant_cli_can_list_but_not_write(tmp_path, monkeypatch):
+    """A worker's shell keeps the fence marker, yet ``kanban list`` is a read: it must print the
+    board instead of failing on its opportunistic ``recompute_ready`` write. Writes stay refused."""
+    db = tmp_path / "assigned.db"
+    conn = connect(db)
+    parent = kb.create_task(conn, title="parent", assignee="ky")
+    child = kb.create_task(conn, title="child", assignee="ky", parents=[parent])
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
+    assert kb.get_task(conn, child).status == "todo"
+    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK", "HERMES_KANBAN_HOME"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(tmp_path))
+
+    def cli(*arguments):
+        return subprocess.run([sys.executable, "-m", "hermes_cli.main", "kanban", "--board", "default", *arguments],
+                              cwd=ROOT, env=dict(os.environ), stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=45, check=False)
+
+    proc = cli("list", "--assignee", "ky", "--json")
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert {row["id"] for row in json.loads(proc.stdout)} == {parent, child}
+    assert kb.get_task(conn, child).status == "todo"  # the read did not promote anything
+    for arguments in (["create", "must refuse"], ["edit", child, "--title", "must refuse"]):
+        proc = cli(*arguments)
+        assert proc.returncode != 0 and "cannot mutate" in proc.stderr, (arguments, proc.stdout, proc.stderr)
+    assert kb.get_task(conn, child).title == "child"
+    assert [t.title for t in kb.list_tasks(conn)].count("must refuse") == 0
+    conn.close()
