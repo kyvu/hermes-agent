@@ -276,7 +276,7 @@ def _run_worker_turns(agent, frame, history):
                                           **({'task_id': task_id} if task_id else {}),
                                           **({'turn_author': author} if author is not None else {}))
     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
-    code, last_output = 1, ''
+    code, last_output, quota = 1, '', {}
     try:
         result = _run_task_turns(agent, frame, history, context)
         code = turn_exit_code(result, kanban_worker=True)
@@ -285,12 +285,15 @@ def _run_worker_turns(agent, frame, history):
             # leaves a body the redactor no longer recognises.
             from hermes_cli import kanban_db as kb
             last_output = kb.redact_review_value(str(result.get('final_response') or ''))[-500:]
+            quota = {key: result[key] for key in ('failure_resets_at',) if type(result.get(key)) in (int, float)}
+            if isinstance(result.get('provider'), str):
+                quota['quota_provider'] = kb.redact_review_value(result['provider'])[:64]
         return result
     except Exception as exc:
         code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc))
         raise
     finally:
-        _record_worker_result(context, code, last_output)
+        _record_worker_result(context, code, last_output, quota)
 
 
 def record_start_failure(frame, exc):
@@ -303,7 +306,7 @@ def record_start_failure(frame, exc):
     _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)), '')
 
 
-def _record_worker_result(context, code, last_output):
+def _record_worker_result(context, code, last_output, quota=None):
     _TURNS_DONE.set()
     import os
     from hermes_cli.kanban_db_connect import connect_closing
@@ -314,7 +317,7 @@ def _record_worker_result(context, code, last_output):
             # result in the immutable attempt event stream instead.
             kb._append_event(conn, context['task_id'], 'worker_result',
                 {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
-                 'last_output': last_output}, run_id=context['run_id'])
+                 'last_output': last_output, **(quota or {})}, run_id=context['run_id'])
 
 
 def record_worker_loss(policy, reason, *, pid=None, bound=False):
