@@ -32,9 +32,10 @@ def board(tmp_path, monkeypatch):
         yield conn
 
 
-def fail_review(conn, monkeypatch, now, text):
+def fail_review(conn, monkeypatch, now, text, *, provider=None):
     monkeypatch.setattr(kbd.time, 'time', lambda: now)
-    tid = kb.create_task(conn, title='quota review', assignee='builder')
+    tid = kb.create_task(conn, title='quota review', assignee='builder',
+                         model_override='m' if provider else None, provider_override=provider)
     claim = kb.claim_task(conn, tid)
     kb.request_review(conn, tid, summary='exact head held', metadata={'head_sha': 'abc123'},
                       reviewer='reviewer', expected_run_id=claim.current_run_id)
@@ -74,7 +75,7 @@ def test_explicit_retry_after_not_capped_to_short_cooldown(board, monkeypatch):
 
 
 def test_old_provider_failure_does_not_hold_new_authorized_override(board, monkeypatch):
-    tid = fail_review(board, monkeypatch, 5_000_000, 'weekly quota exhausted')
+    tid = fail_review(board, monkeypatch, 5_000_000, 'weekly quota exhausted', provider='openrouter')
     monkeypatch.setattr(kbd.time, 'time', lambda: 5_000_001)
     kb.set_model_override(board, tid, 'already-authorized', provider='other-provider')
     assert kbd.check_respawn_guard(board, tid, lane='review') is None
@@ -210,6 +211,37 @@ def test_delayed_reap_uses_failure_time_and_preserves_absolute_hints(board, monk
     assert json.loads(row['metadata'])['retry_not_before'] == expected
     assert kbd.check_respawn_guard(board, tid, lane='review') == 'rate_limit_cooldown'
     monkeypatch.setattr(kbd.time, 'time', lambda: expected)
+    assert kbd.check_respawn_guard(board, tid, lane='review') is None
+
+
+@pytest.mark.parametrize('configured', ['auto', ' AUTO ', None, '', 'unknown'])
+@pytest.mark.parametrize('clear_override', [True, False])
+def test_unresolved_provider_change_keeps_quota_wait(board, monkeypatch, configured, clear_override):
+    from hermes_cli.kanban_quota import policy
+    monkeypatch.setattr(policy, '_configured_provider', lambda _profile: configured)
+    tid = fail_review(board, monkeypatch, 5_000_000, 'weekly quota exhausted',
+                      provider='openrouter' if clear_override else None)
+    # Both clearing a known override and selecting a known override from an
+    # unresolved old route must retain the wait. Neither proves a provider change.
+    kb.set_model_override(board, tid, None if clear_override else 'm',
+                          provider=None if clear_override else 'openrouter')
+    monkeypatch.setattr(kbd.time, 'time', lambda: 5_000_001)
+    assert kbd.check_respawn_guard(board, tid, lane='review') == 'rate_limit_cooldown'
+    assert kb.get_task(board, tid).status == 'review'
+    monkeypatch.setattr(kbd.time, 'time', lambda: 5_021_600)
+    assert kbd.check_respawn_guard(board, tid, lane='review') is None
+
+
+def test_persisted_known_failure_allows_known_different_override_from_auto(board, monkeypatch):
+    from hermes_cli.kanban_quota import policy
+    monkeypatch.setattr(policy, '_configured_provider', lambda _profile: 'auto')
+    tid = fail_review(board, monkeypatch, 5_000_000, 'weekly quota exhausted')
+    run = board.execute("SELECT id,metadata FROM task_runs WHERE task_id=? AND outcome='rate_limited'", (tid,)).fetchone()
+    metadata = json.loads(run['metadata']) | {'quota_provider': 'openrouter'}
+    board.execute('UPDATE task_runs SET metadata=? WHERE id=?', (json.dumps(metadata), run['id']))
+    board.commit()
+    kb.set_model_override(board, tid, 'already-authorized', provider='openai-codex')
+    monkeypatch.setattr(kbd.time, 'time', lambda: 5_000_001)
     assert kbd.check_respawn_guard(board, tid, lane='review') is None
 
 

@@ -71,6 +71,10 @@ def route_changed(conn, task_id, run):
     current = task['provider_override'] or _configured_provider(task['assignee'])
     previous = _plugin_alias_owner(normalize_provider(previous or ''))
     current = _plugin_alias_owner(normalize_provider(current or ''))
+    # Auto/absent identity is not evidence of a different authorized provider.
+    # Keep its wait rather than resolving credentials or guessing auto's route.
+    if previous in ('', 'auto', 'unknown') or current in ('', 'auto', 'unknown'):
+        return False
     return previous != current
 
 
