@@ -16,6 +16,7 @@ from agent.retry_utils import reset_delay_from_message
 from agent.runtime_scope import bind_profile_scope
 from hermes_cli.config import load_config_readonly
 from hermes_cli.profiles import resolve_profile_env
+from hermes_cli.providers import _plugin_alias_owner, normalize_provider
 
 _MAX_PROBE_WAIT = 6 * 3600
 _NAMED_RESET = re.compile(
@@ -68,6 +69,8 @@ def route_changed(conn, task_id, run):
         return False
     previous = _dict(run['metadata']).get('quota_provider') or old[2] or _configured_provider(old[0])
     current = task['provider_override'] or _configured_provider(task['assignee'])
+    previous = _plugin_alias_owner(normalize_provider(previous or ''))
+    current = _plugin_alias_owner(normalize_provider(current or ''))
     return previous != current
 
 
@@ -77,19 +80,19 @@ def _message_deadline(text, now):
     if delay is not None and math.isfinite(delay) and delay >= 0:
         deadlines.append(now + delay)
     # Header-style diagnostics and structured body fields survive stringification.
-    for match in re.finditer(r'(?:retry[-_]after(?:_seconds)?)[\s\"\x27:=]+(\d+(?:\.\d+)?)', text, re.I):
+    for match in re.finditer(r'(?:retry[-_]after(?:_seconds)?)[\s\"\x27:=]+(\d+(?:\.\d+)?)', text, re.IGNORECASE):
         deadlines.append(now + float(match[1]))
-    for match in re.finditer(r'(?:reset_at|resets_at)[\s\"\x27:=]+(\d{10,13}(?:\.\d+)?)', text, re.I):
+    for match in re.finditer(r'(?:reset_at|resets_at)[\s\"\x27:=]+(\d{10,13}(?:\.\d+)?)', text, re.IGNORECASE):
         stamp = float(match[1])
         deadlines.append(stamp / 1000 if stamp > 1e12 else stamp)
-    for match in re.finditer(r'(?:reset_at|resets_at)[\s\"\x27:=]+(\d{4}-\d{2}-\d{2}T[^\s\"\x27}]+)', text, re.I):
+    for match in re.finditer(r'(?:reset_at|resets_at)[\s\"\x27:=]+(\d{4}-\d{2}-\d{2}T[^\s\"\x27}]+)', text, re.IGNORECASE):
         try:
-            stamp = datetime.fromisoformat(match[1].replace('Z', '+00:00'))
+            stamp = datetime.fromisoformat(match[1])
             if stamp.tzinfo is not None:
                 deadlines.append(stamp.timestamp())
         except ValueError:
             pass
-    for match in re.finditer(r'retry-after[\s\"\x27:=]+([A-Za-z]{3},[^\r\n\"\x27}]+GMT)', text, re.I):
+    for match in re.finditer(r'retry-after[\s\"\x27:=]+([A-Za-z]{3},[^\r\n\"\x27}]+GMT)', text, re.IGNORECASE):
         try:
             deadlines.append(parsedate_to_datetime(match[1]).timestamp())
         except (ValueError, TypeError, OverflowError):
@@ -115,14 +118,17 @@ def _message_deadline(text, now):
 def quota_retry_metadata(conn, task_id, run_id, now, cooldown):
     """Persist only a deadline. Never copy provider text or credentials into metadata."""
     result = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_result' ORDER BY id DESC LIMIT 1",
+        "SELECT payload, created_at FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_result' ORDER BY id DESC LIMIT 1",
         (task_id, run_id),
     ).fetchone()
     payload = _dict(result['payload']) if result else {}
     text = str(payload.get('last_output', ''))
     deadline = payload.get('failure_resets_at')
     if type(deadline) not in (int, float) or not math.isfinite(deadline):
-        deadline = _message_deadline(text, now)
+        from hermes_cli.kanban_db import _to_epoch
+        # Relative vendor hints start when the failure was recorded, not when reaped.
+        failed_at = _to_epoch(result['created_at']) if result else None
+        deadline = _message_deadline(text, failed_at if failed_at is not None else now)
     provider = payload.get('quota_provider')
     identity = {'quota_provider': provider} if isinstance(provider, str) and re.fullmatch(r'[\w-]{1,64}', provider) else {}
     if deadline is not None and deadline > now:
@@ -136,8 +142,9 @@ def quota_retry_metadata(conn, task_id, run_id, now, cooldown):
         streak += 1
         if streak >= 16:
             break
+    # Explicit zero is the existing next-tick E2E mode. Production defaults to 300s.
     wait = min(_MAX_PROBE_WAIT, max(0, cooldown) * 2 ** streak)
-    if re.search(r'weekly|billing|credits|subscription|quota.{0,30}exhaust', text, re.I):
+    if re.search(r'weekly|billing|credits|subscription|quota.{0,30}exhaust', text, re.IGNORECASE):
         wait = max(wait, _MAX_PROBE_WAIT)
     return {'retry_not_before': now + wait, 'quota_hint': 'bounded_probe', **identity}
 

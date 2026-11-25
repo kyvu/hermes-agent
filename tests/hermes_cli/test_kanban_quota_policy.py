@@ -7,6 +7,9 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
+from unittest.mock import MagicMock, patch
+
+from tests.agent.test_fallback_429_after_timeout import _make_agent_with_fallback, RateLimitError
 
 import pytest
 
@@ -179,3 +182,144 @@ def test_real_worker_result_preserves_structured_reset(board, monkeypatch):
     monkeypatch.setattr(kbd.time, 'time', lambda: 5_043_199)
     assert kbd.check_respawn_guard(board, tid) == 'rate_limit_cooldown'
     session_kanban._TURNS_DONE.clear()
+
+
+@pytest.mark.parametrize('previous,current', [('deepinfra', 'deep-infra'), ('deep-infra', 'deepinfra')])
+def test_provider_alias_cannot_escape_quota(board, monkeypatch, previous, current):
+    from hermes_cli.kanban_quota import policy
+    monkeypatch.setattr(policy, '_configured_provider', lambda _profile: previous)
+    tid = fail_review(board, monkeypatch, 5_000_000, 'weekly quota exhausted')
+    kb.set_model_override(board, tid, 'm', provider=current)
+    assert kbd.check_respawn_guard(board, tid, lane='review') == 'rate_limit_cooldown'
+
+
+@pytest.mark.parametrize('hint,reap_at,expected', [
+    ('Retry-After: 7200', 2000, 8200),
+    ('Retry-After: 7200', 10000, 10300),
+    ('Retry-After: Thu, 01 Jan 1970 02:16:40 GMT', 2000, 8200),
+    ('Retry-After: Thu, 01 Jan 1970 02:16:40 GMT', 10000, 10300),
+])
+def test_delayed_reap_uses_failure_time_and_preserves_absolute_hints(board, monkeypatch, hint, reap_at, expected):
+    # Keep the failure event at 1000 and delay only the reaper.
+    detect = kbd.detect_crashed_workers
+    monkeypatch.setattr(kbd, 'detect_crashed_workers', lambda _conn: None)
+    tid = fail_review(board, monkeypatch, 1000, hint)
+    monkeypatch.setattr(kbd.time, 'time', lambda: reap_at)
+    detect(board)
+    row = board.execute("SELECT metadata FROM task_runs WHERE task_id=? AND outcome='rate_limited'", (tid,)).fetchone()
+    assert json.loads(row['metadata'])['retry_not_before'] == expected
+    assert kbd.check_respawn_guard(board, tid, lane='review') == 'rate_limit_cooldown'
+    monkeypatch.setattr(kbd.time, 'time', lambda: expected)
+    assert kbd.check_respawn_guard(board, tid, lane='review') is None
+
+
+@pytest.mark.parametrize('terminal_status', [429, 402])
+def test_terminal_fallback_identity_survives_runtime_restore_and_worker_record(board, monkeypatch, terminal_status):
+    from agent.voice_turn_route import _capture
+    from gateway import session_kanban
+
+    agent = _make_agent_with_fallback([{'provider': 'deepinfra', 'model': 'fallback-model',
+                                       'base_url': 'https://api.deepinfra.com/v1/openai'}])
+    agent._api_max_retries = 1
+    tid = kb.create_task(board, title='fallback quota', assignee='reviewer')
+    task = kb.claim_task(board, tid)
+    context = {'task_id': tid, 'run_id': task.current_run_id, 'claim_lock': task.claim_lock,
+               'db': board.execute('PRAGMA database_list').fetchone()[2],
+               'skills': [], 'context': '', 'goal_mode': False}
+    kb._append_event(board, tid, 'worker_bound', {'pid': os.getpid(), 'claim_lock': task.claim_lock},
+                     run_id=task.current_run_id)
+    board.execute('UPDATE tasks SET worker_pid=? WHERE id=?', (77123, tid))
+    board.commit()
+    calls = []
+
+    def fail_api(_kwargs):
+        calls.append(agent.provider)
+        if len(calls) == 1:
+            # The real turn-finally restore must run before the worker records its result.
+            agent._voice_route_state = {**_capture(agent), 'reasoning_config': agent.reasoning_config}
+        error = RateLimitError()
+        if len(calls) > 1 and terminal_status == 402:
+            error.status_code = 402
+            error.body = {'error': {'message': 'Insufficient credits'}}
+            error.args = ('Insufficient credits',)
+        raise error
+
+    client = MagicMock()
+    client.base_url = 'https://api.deepinfra.com/v1/openai'
+    client._custom_headers = client.default_headers = None
+    monkeypatch.setattr('agent.conversation_loop._billing_or_entitlement_message', lambda **_kw: 'quota exhausted')
+    monkeypatch.setattr('agent.skill_commands.build_preloaded_skills_prompt', lambda *a, **k: ('', [], []))
+    frame = {'text': 'work', 'policy': {'kanban_json': json.dumps(context)}}
+    with (
+        patch.object(agent, '_interruptible_api_call', side_effect=fail_api),
+        patch.object(agent, '_persist_session'), patch.object(agent, '_save_trajectory'),
+        patch.object(agent, '_cleanup_task_resources'),
+        patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()),
+        patch('agent.auxiliary_client.resolve_provider_client', return_value=(client, 'fallback-model')),
+        patch('agent.model_metadata.get_model_context_length', return_value=200000),
+    ):
+        try:
+            result = session_kanban._run_worker_turns(agent, frame, [])
+        finally:
+            session_kanban._TURNS_DONE.clear()
+    assert calls == ['zai', 'deepinfra']
+    assert agent.provider == 'zai'
+    assert result['provider'] == 'deepinfra'
+    payload = json.loads(board.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='worker_result'", (tid,)).fetchone()[0])
+    assert payload['quota_provider'] == 'deepinfra'
+    monkeypatch.setattr(kbd, '_classify_worker_exit', lambda _pid: ('rate_limited', 75))
+    kbd.detect_crashed_workers(board)
+    kb.set_model_override(board, tid, 'fallback-model', provider='deep-infra')
+    assert kbd.check_respawn_guard(board, tid) == 'rate_limit_cooldown'
+
+
+def test_quota_reap_dispatch_keeps_exact_head_acceptance_hold(board, monkeypatch):
+    from hermes_cli import kanban_pr_acceptance as acceptance
+    monkeypatch.setattr(kbd, '_profile_exists_fn', lambda: lambda _profile: True)
+    detect = kbd.detect_crashed_workers
+    monkeypatch.setattr(kbd, 'detect_crashed_workers', lambda _conn, **_kw: [])
+    tid = fail_review(board, monkeypatch, 5_000_000, 'Retry-After: 7200')
+    monkeypatch.setattr(kbd, 'detect_crashed_workers', detect)
+    url = 'https://github.com/acme/repo/pull/7'
+    board.execute('UPDATE tasks SET completion_contract=? WHERE id=?', (url, tid))
+    board.commit()
+    spawned = []
+    def spawn(task, *_args, **_kwargs):
+        spawned.append(task.id)
+        return 77124
+    for clock in (5_000_000, 5_000_400, 5_007_199):
+        monkeypatch.setattr(kbd.time, 'time', lambda: clock)
+        tick = kbd.dispatch_once(board, spawn_fn=spawn, reconcile_orphans=False)
+        assert (tid, 'rate_limit_cooldown') in tick.respawn_guarded
+        if clock == 5_000_000:
+            assert tick.rate_limited == [tid]
+        assert not spawned
+        assert kb.get_task(board, tid).status == 'review'
+    monkeypatch.setattr(kbd.time, 'time', lambda: 5_007_200)
+    tick = kbd.dispatch_once(board, spawn_fn=spawn, reconcile_orphans=False)
+    assert spawned == [tid], tick
+    task = kb.get_task(board, tid)
+    assert task.consecutive_failures == 0
+    head, check_head = 'a' * 40, ['b' * 40]
+    monkeypatch.setattr(acceptance, '_assignee_profile_home', lambda _profile: None)
+    def api(path, **_kwargs):
+        if path == 'graphql':
+            return {'data': {'repository': {'pullRequest': {
+                'headRefOid': head, 'baseRefName': 'main', 'state': 'OPEN',
+                'baseRef': {'branchProtectionRule': {'requiredStatusChecks': [
+                    {'context': 'required', 'app': {'databaseId': 1}}]}}}}}}
+        if '/check-runs' in path:
+            return [{'total_count': 1, 'check_runs': [{'id': 42, 'name': 'required',
+                     'head_sha': check_head[0], 'app': {'id': 1}, 'status': 'completed',
+                     'conclusion': 'success'}]}]
+        if '/pulls/' in path:
+            return {'head': {'sha': head}, 'base': {'ref': 'main'}, 'state': 'open'}
+        return [[]]
+    monkeypatch.setattr(acceptance, '_api', api)
+    assert not kb.complete_task(board, tid, summary='approve', expected_run_id=task.current_run_id)
+    assert kb.get_task(board, tid).status != 'done'
+    receipt = json.loads(board.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance' ORDER BY id DESC", (tid,)).fetchone()[0])
+    assert receipt['head_sha'] == head and receipt['classification'] == 'stale'
+    check_head[0] = head
+    assert kb.complete_task(board, tid, summary='approve', expected_run_id=task.current_run_id)
+    assert kb.get_task(board, tid).status == 'done'
