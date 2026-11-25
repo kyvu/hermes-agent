@@ -37,6 +37,7 @@ from agent.turn_failure_copy import (
 from agent.route_verdicts import route_visit
 from agent.turn_retry_state import TurnRetryState
 from agent.turn_recovery_codex import _codex_soft_failure_error, _is_codex_token_expired, _recover_stale_codex_reasoning
+from hermes_cli.providers import _plugin_alias_owner, normalize_provider
 from hermes_constants import display_hermes_home
 from utils import base_url_host_matches
 
@@ -812,11 +813,14 @@ def recover_after_classification(
     return False, recovered_with_pool
 
 
-def _failed_turn_result(final_response: str, messages: Any, api_call_count: int, error: str) -> dict[str, Any]:
+def _failed_turn_result(
+    final_response: str, messages: Any, api_call_count: int, error: str, *, provider: str,
+) -> dict[str, Any]:
     """Base failed-turn result dict shared by the two terminal paths."""
     return {
         "final_response": final_response, "messages": messages, "api_calls": api_call_count,
         "completed": False, "failed": True, "error": error,
+        "provider": _plugin_alias_owner(normalize_provider(provider)),
     }
 
 
@@ -1182,7 +1186,7 @@ def nonretryable_client_error_result(
     _final_response, _keep_partial = _with_delivered_partial(
         _final_response, _nonretryable_summary, delivered,
     )
-    result = _failed_turn_result(_final_response, messages, api_call_count, _nonretryable_summary)
+    result = _failed_turn_result(_final_response, messages, api_call_count, _nonretryable_summary, provider=provider)
     result.update({
         "failure_reason": classified.reason.value,
         "failure_retryable": bool(classified.retryable),
@@ -1318,7 +1322,7 @@ def max_retries_exhausted_result(
             "happens when it writes a very large file in one go. Ask me to write the file in "
             "smaller sections (or via execute_code with Python's open())."
         )
-    result = _failed_turn_result(_final_response, messages, api_call_count, _final_summary)
+    result = _failed_turn_result(_final_response, messages, api_call_count, _final_summary, provider=provider)
     result.update({
         # Classified reason so callers (kanban worker in cli.py) can tell a quota wall
         # (``rate_limit`` / ``billing``) from a task failure.
